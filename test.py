@@ -6,7 +6,8 @@ if __name__ == "__main__":  # 添加主程序入口保护
     try:
         # 初始化模型，并设置较小的 max_model_len
         model = OrpheusModel(
-            model_name="canopylabs/3b-zh-ft-research_release",
+            # 中文模式使用：canopylabs/3b-zh-ft-research_release、canopylabs/3b-zh-pretrain-research_release
+            model_name="canopylabs/3b-zh-pretrain-research_release",
             max_model_len=2048
         )
         
