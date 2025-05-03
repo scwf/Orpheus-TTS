@@ -1,1 +1,5 @@
 .DS_Store
+orpheus_tts_pypi/build
+orpheus_tts_pypi/dist
+orpheus_tts_pypi/orpheus_tts.egg-info
+
