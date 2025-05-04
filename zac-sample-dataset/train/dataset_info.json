@@ -1,0 +1,42 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "zac-sample-dataset",
+  "dataset_size": 12539665,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/canopylabs/zac-sample-dataset@5464e5b186dab0d49049eca0b28774ad9371fc89/data/train-00000-of-00001.parquet": {
+      "num_bytes": 10349037,
+      "checksum": null
+    }
+  },
+  "download_size": 10349037,
+  "features": {
+    "text": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "audio": {
+      "sampling_rate": 48000,
+      "_type": "Audio"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 22888702,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 12539665,
+      "num_examples": 20,
+      "dataset_name": "zac-sample-dataset"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}
