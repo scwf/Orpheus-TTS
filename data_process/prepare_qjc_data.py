@@ -6,6 +6,7 @@ import huggingface_hub
 import torch
 import torchaudio.transforms as T
 from tqdm.auto import tqdm # For progress bars
+import sys
 
 # Suppress Hugging Face logging noise if desired
 # import logging
@@ -14,7 +15,7 @@ from tqdm.auto import tqdm # For progress bars
 
 # --- Configuration ---
 # Set your local data directory path (relative to this script)
-data_dir = Path("../qjc_sample_data")
+data_dir = Path("./qjc_sample_data")
 # Target sampling rate for audio
 target_sampling_rate = 24000
 # Hugging Face Hub configuration
@@ -24,6 +25,9 @@ target_repo_name = "qjc-audio-tokenized" # Name for the FINAL tokenized dataset
 # Using multiprocessing significantly speeds up map operations but uses more RAM
 num_proc = os.cpu_count() - 1 if os.cpu_count() > 1 else None # Use most cores but leave one free
 # SNAC model for audio tokenization
+# SNAC 模型（全称：Self-supervised Non-autoregressive Acoustic Codebook）是一种用于将音频信号（如语音波形）编码
+# 为离散声学标记（acoustic codes，声码）的神经网络模型。SNAC 模型可以将连续的音频波形（如 .wav 文件）转换为一系列离散的"代码"或"token"
+# 它常用于现代文本到语音（TTS, Text-to-Speech）系统的数据预处理和特征提取阶段。
 snac_model_name = "hubertsiuzdak/snac_24khz"
 # Tokenizer for text
 text_tokenizer_name = "canopylabs/orpheus-3b-0.1-pretrained"
@@ -379,42 +383,44 @@ def main():
          print(f"错误: 无法自动检测 Hugging Face 用户名: {e}")
          print("请确保你已通过 'huggingface-cli login' 成功登录。")
 
+    # 准备数据集字典格式
+    if isinstance(final_ds, datasets.Dataset):
+        final_ds_dict = DatasetDict({"train": final_ds})
+    else: # Should already be DatasetDict if split logic was added
+        final_ds_dict = final_ds
+        
+    # 默认的本地保存路径
+    save_path = "./processed_qjc_dataset"
+    
+    # 尝试推送到 Hugging Face Hub（如果有用户名）
+    push_success = False
     if hf_username:
         repo_id = f"{hf_username}/{target_repo_name}"
-        print(f"准备将 *处理后* 的数据集推送到: {repo_id}")
-        confirm = input("确认推送处理后的数据集? (y/n): ").lower() # Add confirmation for safety
-        if confirm == 'y':
-            try:
-                print("正在推送处理后的数据集...")
-                # Use DatasetDict for standard structure if only 'train' split exists
-                if isinstance(final_ds, datasets.Dataset):
-                    final_ds_dict = DatasetDict({"train": final_ds})
-                else: # Should already be DatasetDict if split logic was added
-                    final_ds_dict = final_ds
-
-                final_ds_dict.push_to_hub(repo_id, private=False) # Push the dict
-                print(f"\n处理后的数据集成功推送到: https://huggingface.co/datasets/{repo_id}")
-                print("\n现在你可以使用此仓库名配置 finetune/config.yaml:")
-                print(f"dataset_name: \"{repo_id}\"")
-            except Exception as e:
-                print(f"\n错误: 推送处理后的数据集失败: {e}")
-                print(f"请检查仓库 '{repo_id}' 是否已存在或存在权限问题。")
-        else:
-             print("推送已取消。")
-    else:
-        print("未能获取用户名，推送已跳过。")
-        print("\n你可以手动保存处理后的数据集到本地磁盘:")
-        save_path = "./processed_qjc_dataset"
+        print(f"准备将处理后的数据集推送到: {repo_id}")
+        
         try:
-             if isinstance(final_ds, datasets.Dataset):
-                 final_ds_dict = DatasetDict({"train": final_ds})
-             else:
-                 final_ds_dict = final_ds
-             final_ds_dict.save_to_disk(save_path)
-             print(f"处理后的数据集已保存到本地: {save_path}")
-             print(f"你可以将此目录路径用于 finetune/config.yaml 的 dataset_name。")
+            print("正在推送处理后的数据集...")
+            final_ds_dict.push_to_hub(repo_id, private=False)
+            print(f"\n处理后的数据集成功推送到: https://huggingface.co/datasets/{repo_id}")
+            print("\n现在你可以使用此仓库名配置 finetune/config.yaml:")
+            print(f"dataset_name: \"{repo_id}\"")
+            push_success = True
         except Exception as e:
-             print(f"保存到本地磁盘失败: {e}")
+            print(f"\n错误: 推送处理后的数据集失败: {e}")
+            print("将自动尝试保存到本地...")
+    
+    # 如果推送失败或没有用户名，保存到本地
+    if not push_success:
+        print(f"\n保存处理后的数据集到本地: {save_path}")
+        try:
+            final_ds_dict.save_to_disk(save_path)
+            print(f"处理后的数据集已成功保存到本地: {save_path}")
+            print(f"你可以将此目录路径用于 finetune/config.yaml 的 dataset_name。")
+            print(f"例如: dataset_name: \"{os.path.abspath(save_path)}\"")
+        except Exception as e:
+            print(f"错误: 保存到本地磁盘失败: {e}")
+            print("请检查磁盘空间和写入权限。")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

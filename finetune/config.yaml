@@ -1,17 +1,21 @@
 # CHANGE THIS TO YOUR OWN DATASET
-TTS_dataset: <PATH_TO_YOUR_DATASET>
+TTS_dataset: scwf/qjc-audio-tokenized
 
-model_name: "canopylabs/orpheus-tts-0.1-pretrained"
+model_name: "canopylabs/3b-zh-pretrain-research_release"
 
 # Training Args
-epochs: 1
+epochs: 15
 batch_size: 1
 number_processes: 1
 pad_token: 128263
 save_steps: 5000
 learning_rate: 5.0e-5
 
+# 内存优化选项
+max_length: 4096  # 限制序列最大长度（如果数据序列很长，可以减小此值）
+gradient_accumulation_steps: 4  # 累积多个小批量的梯度，减少内存消耗
+
 # Naming and paths
 save_folder: "checkpoints"
 project_name: "tuning-orpheus"
-run_name: "5e5-0"
+run_name: "qjc-voice-lr5e5-grad4-bf16-v1"  # 包含声音对象(qjc)、学习率(5e-5)、梯度累积(4)、精度(bf16)和版本(v1)
