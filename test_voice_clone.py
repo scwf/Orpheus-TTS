@@ -1,92 +1,276 @@
-from orpheus_tts import OrpheusModel
-import wave
-import time
 import os
+from snac import SNAC
+
 import torch
-from pathlib import Path
+from transformers import AutoModelForCausalLM, Trainer, TrainingArguments, AutoTokenizer
+from huggingface_hub import snapshot_download
+import librosa
+import numpy as np
+from scipy.io.wavfile import write
 
-# 这个方法是错误的，不要使用
-def main():
-    try:
-        # 配置参数
-        model_name = "canopylabs/3b-zh-pretrain-research_release"
-        output_file = "output-cloned.wav"
-        temperature = 0.6
-        top_p = 0.8
-        repetition_penalty = 1.2
-        
-        # 获取qjc_sample_data目录的绝对路径
-        data_dir = os.path.join(os.getcwd(), "qjc_sample_data")
-        
-        # 准备样本文本和音频路径
-        # 样本1：从1.txt读取文本内容，使用1.wav作为音频
-        sample_text_1_path = os.path.join(data_dir, "1.txt")
-        with open(sample_text_1_path, 'r', encoding='utf-8') as f:
-            ref_text = f.read().strip()
-        ref_audio_path = os.path.join(data_dir, "1.wav")
-        
-        # 确保参考音频文件存在
-        ref_audio_path = Path(ref_audio_path).resolve()
-        if not ref_audio_path.exists():
-            raise FileNotFoundError(f"参考音频文件不存在: {ref_audio_path}")
-        
-        # 要生成的目标文本
-        target_text = "你好，很高兴认识你。我的声音是用AI克隆的，听起来怎么样？"
-        
-        # 初始化预训练模型，而非微调模型（预训练模型更适合零样本克隆）
-        print(f"正在加载模型: {model_name}")
-        model = OrpheusModel(
-            model_name=model_name,
-            max_model_len=4096  # 增加上下文长度以容纳参考音频内容
+# 本克隆语音脚本参考自 https://github.com/canopyai/Orpheus-TTS/issues/6#issuecomment-2740961379
+# todo： 目前测试中文的克隆效果不佳，需要进一步测试下英文的克隆效果
+def load_orpheus_tokenizer(model_id: str = "canopylabs/3b-zh-pretrain-research_release") -> AutoTokenizer:
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    return tokenizer
+
+def load_snac():
+    snac_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
+    return snac_model
+
+def load_orpheus_auto_model(model_id: str = "canopylabs/3b-zh-pretrain-research_release"):
+    # Download only model config and safetensors
+    _model_path = snapshot_download(
+        repo_id=model_id,
+        allow_patterns=[
+            "config.json",
+            "*.safetensors",
+            "model.safetensors.index.json",
+        ],
+        ignore_patterns=[
+            "optimizer.pt",
+            "pytorch_model.bin",
+            "training_args.bin",
+            "scheduler.pt",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.*"
+        ]
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    model.cuda()
+    return model
+
+
+def tokenize_audio(audio_file_path, snac_model):
+    audio_array, sample_rate = librosa.load(audio_file_path, sr=24000)
+    waveform = torch.from_numpy(audio_array).unsqueeze(0)
+    waveform = waveform.to(dtype=torch.float32)
+
+    waveform = waveform.unsqueeze(0)
+
+    with torch.inference_mode():
+        codes = snac_model.encode(waveform)
+
+    all_codes = []
+    for i in range(codes[0].shape[1]):
+        all_codes.append(codes[0][0][i].item() + 128266)
+        all_codes.append(codes[1][0][2 * i].item() + 128266 + 4096)
+        all_codes.append(codes[2][0][4 * i].item() + 128266 + (2 * 4096))
+        all_codes.append(codes[2][0][(4 * i) + 1].item() + 128266 + (3 * 4096))
+        all_codes.append(codes[1][0][(2 * i) + 1].item() + 128266 + (4 * 4096))
+        all_codes.append(codes[2][0][(4 * i) + 2].item() + 128266 + (5 * 4096))
+        all_codes.append(codes[2][0][(4 * i) + 3].item() + 128266 + (6 * 4096))
+
+    return all_codes
+
+
+def prepare_inputs(
+    fpath_audio_ref,
+    audio_ref_transcript: str,
+    text_prompts: list[str],
+    snac_model,
+    tokenizer,
+):
+    audio_tokens = tokenize_audio(fpath_audio_ref, snac_model)
+
+    start_tokens = torch.tensor([[128259]], dtype=torch.int64)
+    end_tokens = torch.tensor([[128009, 128260, 128261, 128257]], dtype=torch.int64)
+    final_tokens = torch.tensor([[128258, 128262]], dtype=torch.int64)
+
+    transcript_tokens = tokenizer(audio_ref_transcript, return_tensors="pt")
+
+    # REF PROMPT TOKENS could be precomputed
+    input_ids = transcript_tokens['input_ids']
+    zeroprompt_input_ids = torch.cat([start_tokens, input_ids, end_tokens, torch.tensor([audio_tokens]), final_tokens], dim=1)  # SOH SOT Text EOT EOH
+
+    # PROMPT TOKENS (what to say)
+    all_modified_input_ids = []
+    for prompt in text_prompts:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        second_input_ids = torch.cat([zeroprompt_input_ids, start_tokens, input_ids, end_tokens], dim=1)
+        all_modified_input_ids.append(second_input_ids)
+
+    all_padded_tensors = []
+    all_attention_masks = []
+    max_length = max([modified_input_ids.shape[1] for modified_input_ids in all_modified_input_ids])
+
+    for modified_input_ids in all_modified_input_ids:
+        padding = max_length - modified_input_ids.shape[1]
+        padded_tensor = torch.cat([torch.full((1, padding), 128263, dtype=torch.int64), modified_input_ids], dim=1)
+        attention_mask = torch.cat([torch.zeros((1, padding), dtype=torch.int64),
+                                    torch.ones((1, modified_input_ids.shape[1]), dtype=torch.int64)], dim=1)
+        all_padded_tensors.append(padded_tensor)
+        all_attention_masks.append(attention_mask)
+
+    all_padded_tensors = torch.cat(all_padded_tensors, dim=0)
+    all_attention_masks = torch.cat(all_attention_masks, dim=0)
+
+    input_ids = all_padded_tensors.to("cuda")
+    attention_mask = all_attention_masks.to("cuda")
+    return input_ids, attention_mask
+
+
+# Please pass your input's `attention_mask` to obtain reliable results.
+# Setting `pad_token_id` to `eos_token_id`:128258 for open-end generation.
+def inference(model, input_ids, attention_mask):
+    with torch.no_grad():
+        generated_ids = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=990,
+            do_sample=True,
+            temperature=0.5,
+            # top_k=40,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            num_return_sequences=1,
+            eos_token_id=128258,
+            # end_token_id=128009
         )
-        
-        print("参考音频：", ref_audio_path)
-        print("参考文本：", ref_text)
-        print("目标文本：", target_text)
-        
-        # 构建 DALLE 风格的零样本克隆提示格式
-        # 对于预训练模型，使用参考文本和参考音频作为上下文，然后加入目标文本
-        # 这种格式尝试让模型理解：这是参考文本的发音方式，现在用同样的声音说目标文本
-        prompt = f"<speak>{ref_text}</speak> <audio>{ref_audio_path}</audio> <speak>{target_text}</speak>"
-        
-        print(f"使用以下提示进行语音生成：\n{prompt}")
-        
-        # 开始计时
-        start_time = time.monotonic()
-        
-        # 生成语音（使用较高的重复惩罚和自定义温度以获得更好的韵律）
-        print("开始生成语音...")
-        syn_tokens = model.generate_speech(
-            prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            max_tokens=2000  # 足够长以包含完整响应
-        )
 
-        # 保存音频
-        with wave.open(output_file, "wb") as wf:
-            wf.setnchannels(1)  # 单声道
-            wf.setsampwidth(2)  # 16位音频
-            wf.setframerate(24000)  # 采样率24kHz
+        # dunno
+        # generated_ids = torch.cat([generated_ids, torch.tensor([[128262]]).to("cuda")], dim=1) # EOAI
 
-            total_frames = 0
-            chunk_counter = 0
-            for audio_chunk in syn_tokens:  # 流式输出
-                chunk_counter += 1
-                frame_count = len(audio_chunk) // (wf.getsampwidth() * wf.getnchannels())
-                total_frames += frame_count
-                wf.writeframes(audio_chunk)
-            duration = total_frames / wf.getframerate()
+        return generated_ids
 
-            end_time = time.monotonic()
-            print(f"生成 {duration:.2f} 秒的音频用时 {end_time - start_time:.2f} 秒")
-            print(f"音频已保存至: {os.path.abspath(output_file)}")
 
-    except Exception as e:
-        print(f"生成过程中出现错误: {str(e)}")
-        import traceback
-        traceback.print_exc()
+def convert_tokens_to_speech(generated_ids, snac_model):
+    token_to_find = 128257
+    token_to_remove = 128258
+    token_indices = (generated_ids == token_to_find).nonzero(as_tuple=True)
+
+    if len(token_indices[1]) > 0:
+        last_occurrence_idx = token_indices[1][-1].item()
+        cropped_tensor = generated_ids[:, last_occurrence_idx + 1:]
+    else:
+        cropped_tensor = generated_ids
+
+    _mask = cropped_tensor != token_to_remove
+    processed_rows = []
+    for row in cropped_tensor:
+        # Apply the mask to each row
+        masked_row = row[row != token_to_remove]
+        processed_rows.append(masked_row)
+
+    code_lists = []
+    for row in processed_rows:
+        # row is a 1D tensor with its own length
+        row_length = row.size(0)
+        new_length = (row_length // 7) * 7  # largest multiple of 7 that fits in this row
+        trimmed_row = row[:new_length]
+        trimmed_row = [t - 128266 for t in trimmed_row]
+        code_lists.append(trimmed_row)
+
+    my_samples = []
+    for code_list in code_lists:
+        samples = redistribute_codes(code_list, snac_model)
+        my_samples.append(samples)
+
+    return my_samples
+
+
+def redistribute_codes(code_list, snac_model):
+    layer_1 = []
+    layer_2 = []
+    layer_3 = []
+
+    for i in range((len(code_list) + 1) // 7):
+        layer_1.append(code_list[7 * i])
+        layer_2.append(code_list[7 * i + 1] - 4096)
+        layer_3.append(code_list[7 * i + 2] - (2 * 4096))
+        layer_3.append(code_list[7 * i + 3] - (3 * 4096))
+        layer_2.append(code_list[7 * i + 4] - (4 * 4096))
+        layer_3.append(code_list[7 * i + 5] - (5 * 4096))
+        layer_3.append(code_list[7 * i + 6] - (6 * 4096))
+
+    codes = [
+        torch.tensor(layer_1).unsqueeze(0),
+        torch.tensor(layer_2).unsqueeze(0),
+        torch.tensor(layer_3).unsqueeze(0)
+    ]
+    audio_hat = snac_model.decode(codes)
+    return audio_hat
+
+
+def to_wav_from(samples: list) -> list[np.ndarray]:
+    """Converts a list of PyTorch tensors (or NumPy arrays) to NumPy arrays."""
+    processed_samples = []
+
+    for s in samples:
+        if isinstance(s, torch.Tensor):  # Check if it's a tensor
+            s = s.detach().squeeze().to('cpu').numpy()
+        else:  # Assume it's already a NumPy array
+            s = np.squeeze(s)
+
+        processed_samples.append(s)
+
+    return processed_samples
+
+
+def zero_shot_tts(fpath_audio_ref, audio_ref_transcript, texts: list[str], model, snac_model, tokenizer):
+    inp_ids, attn_mask = prepare_inputs(fpath_audio_ref, audio_ref_transcript, texts, snac_model, tokenizer)
+    gen_ids = inference(model, inp_ids, attn_mask)
+    samples = convert_tokens_to_speech(gen_ids, snac_model)
+    wav_forms = to_wav_from(samples)
+    return wav_forms
+
+
+def save_wav(samples: list[np.array], sample_rate: int, filenames: list[str]):
+    """ Saves a list of tensors as .wav files.
+
+    Args:
+        samples (list[torch.Tensor]): List of audio tensors.
+        sample_rate (int): Sample rate in Hz.
+        filenames (list[str]): List of filenames to save.
+    """
+    wav_data = to_wav_from(samples)
+
+    for data, filename in zip(wav_data, filenames):
+        write(filename, sample_rate, data.astype(np.float32))
+        print(f"saved to {filename}")
+
+
+def get_ref_audio_and_transcript(root_folder: str):
+    root_path = Path(root_folder)
+
+    out = []
+    for speaker_folder in root_path.iterdir():
+        if speaker_folder.is_dir():  # Ensure it's a directory
+            wav_files = list(speaker_folder.glob("*.wav"))
+            txt_files = list(speaker_folder.glob("t.txt"))
+
+            if wav_files and txt_files:
+                ref_audio = wav_files[0]  # Assume only one .wav file per folder
+                transcript = txt_files[0].read_text(encoding="utf-8").strip()
+                out.append((ref_audio, transcript))
+
+    return out
 
 if __name__ == "__main__":
-    main() 
+    tokenizer = load_orpheus_tokenizer()
+    model = load_orpheus_auto_model()
+    snac_model = load_snac()
+
+    texts = [
+        "今天上海的天气真不错，适合去外滩散步。"
+    ]
+    # prompt_pairs = [("path_to_audio", "transcript")]
+    # prompt_pairs = get_ref_audio_and_transcript("/data")   
+    prompt_pairs = [("qjc_sample_data/1.wav", "你说遇事不决，可问春风，春风不语，即随本心。")]
+    
+    for fpath_audio, audio_transcript in prompt_pairs:
+        print(f"zero shot: {fpath_audio} {audio_transcript}")
+        wav_forms = zero_shot_tts(fpath_audio, audio_transcript, texts, model, snac_model, tokenizer)
+
+        import os
+        from pathlib import Path
+
+        out_dir = Path(fpath_audio).parent / "inference-output"
+        out_dir.mkdir(parents=True, exist_ok=True)  # Correct method
+        file_names = [f"{out_dir.as_posix()}/{Path(fpath_audio).stem}_{i}.wav" for i, t in enumerate(texts)]
+        save_wav(wav_forms, 24000, file_names)

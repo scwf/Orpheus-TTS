@@ -75,3 +75,6 @@
         
         # ... 后续处理和保存音频文件的代码 ...
         ```
+## 零样本实现声音克隆
+
+参考 https://github.com/canopyai/Orpheus-TTS/issues/6#issuecomment-2740961379
